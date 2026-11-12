@@ -41,6 +41,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let i = args.firstIndex(of: "--transcribe"), i + 1 < args.count {
             model.transcribe(file: URL(fileURLWithPath: args[i + 1]))
         }
+        if let i = args.firstIndex(of: "--dictate"), i + 1 < args.count, let secs = Double(args[i + 1]) {
+            model.startDictation()
+            DispatchQueue.main.asyncAfter(deadline: .now() + secs) { model.stopDictation() }
+        }
     }
 
     private func registerHotkey() {

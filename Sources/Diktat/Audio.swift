@@ -2,9 +2,20 @@ import AVFoundation
 import CoreMedia
 
 /// Microphone → 16 kHz mono s16le chunks.
+///
+/// Survives device/format changes: Bluetooth headsets (AirPods) switch to the hands-free profile
+/// when the mic opens, which changes the input format and silently stops AVAudioEngine. We restart
+/// on AVAudioEngineConfigurationChange and also when no buffers arrive for a while (watchdog).
 final class MicCapture {
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true)!
+    private let lock = NSLock()
+    private var lastBuffer = Date()
+    private var lastRestart = Date.distantPast
+    private var running = false
+    private var observer: NSObjectProtocol?
+    private var watchdog: Timer?
+    private var buffers = 0
     var onChunk: ((Data) -> Void)?
     var onLevel: ((Float) -> Void)?
 
@@ -16,15 +27,58 @@ final class MicCapture {
         }
     }
 
+    /// Must be called on the main thread.
     func start() throws {
+        running = true
+        try startEngine()
+        observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                                          object: nil, queue: .main) { [weak self] note in
+            guard let self, (note.object as? AVAudioEngine) === self.engine else { return }
+            self.restart(reason: "audio configuration changed")
+        }
+        watchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, self.running else { return }
+            let idle = Date().timeIntervalSince(self.lock.withLock { self.lastBuffer })
+            if idle > 1.5 { self.restart(reason: String(format: "no audio buffers for %.1fs", idle)) }
+        }
+    }
+
+    func stop() {
+        running = false
+        watchdog?.invalidate(); watchdog = nil
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        Log.write("mic stopped (\(buffers) buffers)")
+    }
+
+    private func restart(reason: String) {
+        guard running, Date().timeIntervalSince(lastRestart) > 1 else { return }
+        lastRestart = Date()
+        Log.write("mic restart: \(reason)")
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        engine = AVAudioEngine()     // a fresh engine picks up the new device format
+        do { try startEngine() } catch {
+            Log.write("mic restart failed: \(error.localizedDescription)")
+            lock.withLock { lastBuffer = Date() }   // let the watchdog retry in a bit
+        }
+    }
+
+    private func startEngine() throws {
         let input = engine.inputNode
         let inFormat = input.outputFormat(forBus: 0)
-        guard inFormat.sampleRate > 0, let converter = AVAudioConverter(from: inFormat, to: target) else {
+        Log.write("mic start: \(Int(inFormat.sampleRate)) Hz, \(inFormat.channelCount) ch")
+        guard inFormat.sampleRate > 0, inFormat.channelCount > 0,
+              let converter = AVAudioConverter(from: inFormat, to: target) else {
             throw NSError(domain: "Diktat", code: 1, userInfo: [NSLocalizedDescriptionKey: "No microphone input available"])
         }
         let ratio = target.sampleRate / inFormat.sampleRate
         input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
             guard let self else { return }
+            self.lock.withLock { self.lastBuffer = Date() }
+            self.buffers += 1
             let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
             guard let out = AVAudioPCMBuffer(pcmFormat: self.target, frameCapacity: cap) else { return }
             var fed = false
@@ -44,11 +98,7 @@ final class MicCapture {
         }
         engine.prepare()
         try engine.start()
-    }
-
-    func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        lock.withLock { lastBuffer = Date() }
     }
 }
 

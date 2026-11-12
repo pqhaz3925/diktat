@@ -65,8 +65,12 @@ final class AppModel: ObservableObject {
     var onPhaseChange: ((Phase) -> Void)?
 
     private let d = UserDefaults.standard
-    private var stream: VoiceStream?
+    private var stream: VoiceStream? { didSet { audioSink.set(stream) } }
     private var mic: MicCapture?
+    /// Audio-thread-safe pointer to the current stream (swapped on reconnect).
+    private let audioSink = StreamSink()
+    private var token = ""
+    private var reconnects = 0
     private var stopRequested = false
     private var sessionID = 0
 
@@ -143,14 +147,18 @@ final class AppModel: ObservableObject {
             }
             guard sid == sessionID else { return }
             do {
-                let token = try Token.load()
+                token = try Token.load()
+                reconnects = 0
+                Log.write("dictation start (lang \(language))")
                 let s = makeStream(sid: sid)
                 s.connect(token: token, language: language, keyterms: allKeyterms)
+                stream = s
                 let m = MicCapture()
-                m.onChunk = { [weak s] data in s?.send(data) }
+                let sink = audioSink
+                m.onChunk = { data in sink.send(data) }
                 m.onLevel = { lvl in DispatchQueue.main.async { AppModel.shared.level = lvl } }
                 try m.start()
-                stream = s; mic = m
+                mic = m
                 setPhase(.recording)
                 if stopRequested { stopDictation() }
             } catch {
@@ -166,9 +174,13 @@ final class AppModel: ObservableObject {
         level = 0
         setPhase(.finishing)
         let s = stream
+        let sid = sessionID
         Task {
-            await s?.finish()
+            let rest = await s?.finish() ?? ""
+            guard sid == sessionID else { return }
             stream = nil
+            pending = ""
+            if !rest.isEmpty { finals.append(rest) }
             deliver(source: nil)
             setPhase(.idle)
         }
@@ -214,14 +226,16 @@ final class AppModel: ObservableObject {
                     if ahead > 0 { try await Task.sleep(nanoseconds: UInt64(ahead * 1e9)) }
                 }
                 setPhase(.file("Finishing \(url.lastPathComponent)…"))
-                await s.finish(timeout: 15)
+                let rest = await s.finish(timeout: 15)
                 stream = nil
                 guard sid == sessionID else { return }
+                pending = ""
+                if !rest.isEmpty { finals.append(rest) }
                 let result = deliver(source: url.lastPathComponent, paste: false)
                 if saveTxtNextToFile, !result.isEmpty {
                     let out = url.deletingPathExtension().appendingPathExtension("txt")
                     if (try? (result + "\n").write(to: out, atomically: true, encoding: .utf8)) != nil {
-                        notice = "Saved \(out.lastPathComponent) · copied to clipboard"
+                        notice = "Saved \(out.lastPathComponent)"
                     }
                 }
                 setPhase(.idle)
@@ -240,7 +254,18 @@ final class AppModel: ObservableObject {
             case .ready: break
             case .interim(let t): self.pending = t
             case .final(let t): self.finals.append(t); self.pending = ""
-            case .failure(let msg):
+            case .failure(let msg, let wasOpen):
+                // Mid-dictation drop: keep what we have and continue on a fresh connection.
+                if wasOpen, self.phase == .recording, self.reconnects < 5 {
+                    self.reconnects += 1
+                    Log.write("reconnecting (#\(self.reconnects)) after: \(msg)")
+                    if !self.pending.isEmpty { self.finals.append(self.pending); self.pending = "" }
+                    let s = self.makeStream(sid: sid)
+                    s.connect(token: self.token, language: self.language, keyterms: self.allKeyterms)
+                    self.stream = s
+                    return
+                }
+                Log.write("session failed: \(msg)")
                 self.error = msg
                 if self.phase == .recording || self.phase == .connecting {
                     self.mic?.stop(); self.mic = nil
@@ -271,11 +296,7 @@ final class AppModel: ObservableObject {
             ? text.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + segment
             : Self.join(text, segment)
         if source != nil { addHistory(segment, source: source) }
-        if paste && autoPaste {
-            pasteIntoFrontApp(segment)      // only the new piece goes into the other app
-        } else {
-            copy(text)
-        }
+        if paste && autoPaste { pasteIntoFrontApp(segment) }   // only the new piece goes into the other app
         return segment
     }
 
@@ -335,4 +356,12 @@ final class AppModel: ObservableObject {
         return t >= 3600 ? String(format: "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60)
                          : String(format: "%d:%02d", t / 60, t % 60)
     }
+}
+
+/// Lets the realtime audio thread hand chunks to whichever stream is current.
+final class StreamSink {
+    private let lock = NSLock()
+    private var stream: VoiceStream?
+    func set(_ s: VoiceStream?) { lock.withLock { stream = s } }
+    func send(_ data: Data) { lock.withLock { stream }?.send(data) }
 }

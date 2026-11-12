@@ -13,7 +13,8 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
         case ready
         case interim(String)
         case final(String)
-        case failure(String)
+        /// `wasOpen`: the socket had connected before failing (i.e. a mid-stream drop, worth reconnecting).
+        case failure(String, wasOpen: Bool)
     }
 
     /// Terms Claude Code itself always sends.
@@ -36,6 +37,8 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
     private var endpointAfterClose = false
     private var dead = false
     private var lastMessage = Date()
+    private var everOpen = false
+    private var bytesSent = 0
     private let onEvent: (Event) -> Void
 
     /// `onEvent` is always called on the main queue.
@@ -96,11 +99,13 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
         queue.async {
             guard !self.closing, !self.dead else { return }
             if self.isOpen { self.task?.send(.data(data)) { _ in } } else { self.backlog.append(data) }
+            self.bytesSent += data.count
         }
     }
 
-    /// Sends CloseStream, waits for the trailing transcript, emits the last `.final`, closes the socket.
-    func finish(timeout: TimeInterval = 8) async {
+    /// Sends CloseStream, waits for the trailing transcript, closes the socket.
+    /// Returns the last not-yet-final text (the caller appends it; it is not emitted as `.final`).
+    func finish(timeout: TimeInterval = 8) async -> String {
         queue.sync {
             closing = true
             if isOpen { sendText(#"{"type":"CloseStream"}"#) }
@@ -116,13 +121,17 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
             if done { break }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        queue.sync {
-            flushPending()
+        let rest: String = queue.sync {
+            let r = pending.trimmingCharacters(in: .whitespacesAndNewlines)
+            pending = ""
             dead = true
             keepAlive?.cancel(); keepAlive = nil
             task?.cancel(with: .normalClosure, reason: nil)
+            Log.write("stream finished: \(bytesSent / Self.bytesPerSecond)s audio sent")
+            return r
         }
         session.finishTasksAndInvalidate()
+        return rest
     }
 
     func cancel() {
@@ -175,10 +184,12 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
             if closing { endpointAfterClose = true }
         case "TranscriptError":
             flushPending()
-            if !closing { emit(.failure((obj["description"] ?? obj["error_code"]).map { "\($0)" } ?? "transcription error")) }
+            Log.write("TranscriptError \(obj["error_code"] ?? "")")
+            if !closing { emit(.failure((obj["description"] ?? obj["error_code"]).map { "\($0)" } ?? "transcription error", wasOpen: true)) }
         case "error":
             flushPending()
-            if !closing { emit(.failure((obj["message"] as? String) ?? "server error")) }
+            Log.write("server error frame")
+            if !closing { emit(.failure((obj["message"] as? String) ?? "server error", wasOpen: true)) }
         default:
             break
         }
@@ -189,20 +200,23 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
         flushPending()
         dead = true
         keepAlive?.cancel(); keepAlive = nil
+        Log.write("stream failed (open=\(everOpen), closing=\(closing)): \(err.localizedDescription)")
         if closing { return }
         if let http = task?.response as? HTTPURLResponse, http.statusCode != 101 {
             let hint = http.statusCode == 401 || http.statusCode == 403
                 ? " — is Claude Code logged in with a Claude.ai subscription?" : ""
-            emit(.failure("Voice stream rejected: HTTP \(http.statusCode)\(hint)"))
+            emit(.failure("Voice stream rejected: HTTP \(http.statusCode)\(hint)", wasOpen: false))
         } else {
-            emit(.failure("Voice stream error: \(err.localizedDescription)"))
+            emit(.failure("Voice stream error: \(err.localizedDescription)", wasOpen: everOpen))
         }
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
         isOpen = true
+        everOpen = true
         lastMessage = Date()
+        Log.write("stream open (\(backlog.count) chunks buffered)")
         sendText(#"{"type":"KeepAlive"}"#)
         // Coalesce whatever was captured while connecting into ≤32 KB frames (as Claude Code does).
         var frame = Data()
@@ -223,7 +237,12 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        let why = reason.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        Log.write("stream closed by server: code \(closeCode.rawValue) \(why) (closing=\(closing))")
         flushPending()
+        guard !dead else { return }
         dead = true
+        keepAlive?.cancel(); keepAlive = nil
+        if !closing { emit(.failure("Connection closed (code \(closeCode.rawValue))", wasOpen: true)) }
     }
 }
