@@ -108,6 +108,7 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
     func finish(timeout: TimeInterval = 8) async -> String {
         queue.sync {
             closing = true
+            Log.write("→ CloseStream (open=\(isOpen), pending \(pending.count) chars)")
             if isOpen { sendText(#"{"type":"CloseStream"}"#) }
         }
         let start = Date()
@@ -123,6 +124,7 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
         }
         let rest: String = queue.sync {
             let r = pending.trimmingCharacters(in: .whitespacesAndNewlines)
+            Log.debug("finish leftover: \(r)")
             pending = ""
             dead = true
             keepAlive?.cancel(); keepAlive = nil
@@ -174,6 +176,7 @@ final class VoiceStream: NSObject, URLSessionWebSocketDelegate {
 
     private func handle(_ text: String) {
         lastMessage = Date()
+        Log.debug("← \(text.count > 600 ? String(text.prefix(600)) + "…" : text)")
         guard let obj = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
               let type = obj["type"] as? String else { return }
         switch type {

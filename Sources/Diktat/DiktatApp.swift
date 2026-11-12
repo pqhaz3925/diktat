@@ -200,6 +200,7 @@ struct MenuView: View {
             Toggle("Auto-paste into the front app", isOn: $model.autoPaste)
             Toggle("Save .txt next to transcribed files", isOn: $model.saveTxtNextToFile)
             Toggle("Include Claude Code's built-in terms", isOn: $model.useBuiltinTerms)
+            Toggle("Verbose log + keep last recording (~/Library/Logs)", isOn: $model.verboseLog)
             Text("Key terms — one per line, ASCII only (Latin spelling is what the model will output)")
                 .font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $model.keyterms)

@@ -59,6 +59,7 @@ final class AppModel: ObservableObject {
     @Published var holdToTalk: Bool { didSet { d.set(holdToTalk, forKey: "holdToTalk") } }
     @Published var autoPaste: Bool { didSet { d.set(autoPaste, forKey: "autoPaste"); if autoPaste { ensureAccessibility() } } }
     @Published var saveTxtNextToFile: Bool { didSet { d.set(saveTxtNextToFile, forKey: "saveTxt") } }
+    @Published var verboseLog: Bool { didSet { d.set(verboseLog, forKey: "verboseLog") } }
     @Published var hotkey: HotkeyPreset { didSet { d.set(hotkey.rawValue, forKey: "hotkey"); onHotkeyChange?() } }
 
     var onHotkeyChange: (() -> Void)?
@@ -98,6 +99,7 @@ final class AppModel: ObservableObject {
         holdToTalk = d.bool(forKey: "holdToTalk")
         autoPaste = d.bool(forKey: "autoPaste")
         saveTxtNextToFile = d.bool(forKey: "saveTxt")
+        verboseLog = d.bool(forKey: "verboseLog")
         hotkey = HotkeyPreset(rawValue: d.string(forKey: "hotkey") ?? "") ?? .ctrlOptSpace
         if let data = d.data(forKey: "history"), let h = try? JSONDecoder().decode([HistoryEntry].self, from: data) {
             history = h
@@ -156,6 +158,7 @@ final class AppModel: ObservableObject {
                 let m = MicCapture()
                 let sink = audioSink
                 m.onChunk = { data in sink.send(data) }
+                sink.startRecording(Log.verbose)
                 m.onLevel = { lvl in DispatchQueue.main.async { AppModel.shared.level = lvl } }
                 try m.start()
                 mic = m
@@ -177,6 +180,7 @@ final class AppModel: ObservableObject {
         let sid = sessionID
         Task {
             let rest = await s?.finish() ?? ""
+            if let pcm = audioSink.takeRecording() { Log.saveWAV(pcm); Log.write("saved \(Log.lastAudioURL.lastPathComponent) (\(pcm.count / 32000)s)") }
             guard sid == sessionID else { return }
             stream = nil
             pending = ""
@@ -253,7 +257,9 @@ final class AppModel: ObservableObject {
             switch event {
             case .ready: break
             case .interim(let t): self.pending = t
-            case .final(let t): self.finals.append(t); self.pending = ""
+            case .final(let t):
+                Log.debug("model final #\(self.finals.count + 1): \(t)")
+                self.finals.append(t); self.pending = ""
             case .failure(let msg, let wasOpen):
                 // Mid-dictation drop: keep what we have and continue on a fresh connection.
                 if wasOpen, self.phase == .recording, self.reconnects < 5 {
@@ -286,6 +292,8 @@ final class AppModel: ObservableObject {
     private func deliver(source: String?, paste: Bool = true) -> String {
         if !pending.isEmpty { finals.append(pending); pending = "" }
         let segment = finals.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        Log.write("deliver: \(finals.count) piece(s), \(segment.count) chars")
+        Log.debug("deliver text: \(segment)")
         finals = []
         guard !segment.isEmpty else {
             if error == nil && source == nil { notice = "Nothing recognized" }
@@ -362,6 +370,12 @@ final class AppModel: ObservableObject {
 final class StreamSink {
     private let lock = NSLock()
     private var stream: VoiceStream?
+    private var recording: Data?
     func set(_ s: VoiceStream?) { lock.withLock { stream = s } }
-    func send(_ data: Data) { lock.withLock { stream }?.send(data) }
+    func send(_ data: Data) {
+        let s: VoiceStream? = lock.withLock { recording?.append(data); return stream }
+        s?.send(data)
+    }
+    func startRecording(_ on: Bool) { lock.withLock { recording = on ? Data() : nil } }
+    func takeRecording() -> Data? { lock.withLock { defer { recording = nil }; return recording } }
 }
