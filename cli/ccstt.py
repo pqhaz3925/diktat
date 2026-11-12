@@ -3,22 +3,22 @@
 # requires-python = ">=3.11"
 # dependencies = ["websockets>=13"]
 # ///
-"""ccstt — speech-to-text via Claude Code's voice_stream endpoint (wss://api.anthropic.com/api/ws/speech_to_text/voice_stream).
+"""ccstt — speech-to-text via the endpoint behind Claude Code's voice mode.
 
-Протокол снят с Claude Code 2.1.322 (chunk с CXo/vXo, useVoice):
-  * WS GET {BASE_API_URL→wss}/api/ws/speech_to_text/voice_stream?encoding=linear16&sample_rate=16000&channels=1
-        &endpointing_ms=300&utterance_end_ms=1000&language=<код>&use_conversation_engine=true[&forward_interims=typed]
-  * заголовки: Authorization: Bearer <claude.ai OAuth access token>, x-app: cli, User-Agent: claude-cli/...,
-        anthropic-client-platform, x-config-keyterms: "term1,term2,..." (ASCII, ≤1024 симв., без запятых внутри)
-  * клиент → сервер: бинарные кадры PCM s16le 16 кГц моно; текст {"type":"KeepAlive"} сразу и каждые 8 с;
-        {"type":"CloseStream"} в конце
-  * сервер → клиент: {"type":"TranscriptInterim"|"TranscriptText","data":"..."} — текущая гипотеза сегмента,
-        {"type":"TranscriptEndpoint"} — сегмент закончен (последний interim становится финалом),
+Protocol (observed in Claude Code 2.1.x; see README for details):
+  * WS GET wss://api.anthropic.com/api/ws/speech_to_text/voice_stream?encoding=linear16&sample_rate=16000&channels=1
+        &endpointing_ms=300&utterance_end_ms=1000&language=<code>&use_conversation_engine=true[&forward_interims=typed]
+  * headers: Authorization: Bearer <claude.ai OAuth access token>, x-app: cli, User-Agent: claude-cli/...,
+        anthropic-client-platform, x-config-keyterms: "term1,term2,..." (ASCII, <=1024 chars, no commas inside a term)
+  * client -> server: binary PCM s16le 16 kHz mono; text {"type":"KeepAlive"} on open and every 8 s;
+        {"type":"CloseStream"} at the end
+  * server -> client: {"type":"TranscriptInterim"|"TranscriptText","data":"..."} current hypothesis,
+        {"type":"TranscriptEndpoint"} segment done (last hypothesis becomes final),
         {"type":"TranscriptError","description"/"error_code"}, {"type":"error","message"}
 
-Использование:
-  ccstt file.m4a [-l ru] [-k "Kubernetes,Helm"] [--keyterms-file terms.txt]   # файл (через ffmpeg)
-  ccstt [-l ru]                                                              # микрофон, Enter/Ctrl+C — стоп
+Usage:
+  ccstt file.m4a [-l ru] [-k "Kubernetes,Helm"] [--keyterms-file terms.txt]   # file (decoded with ffmpeg)
+  ccstt [-l ru]                                                              # microphone, Enter/Ctrl+C to stop
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ KEEPALIVE = json.dumps({"type": "KeepAlive"}, separators=(",", ":"))
 CLOSE = json.dumps({"type": "CloseStream"}, separators=(",", ":"))
 CC_VERSION = os.environ.get("CCSTT_CC_VERSION", "2.1.322")
 
-# Тот же базовый словарь, что вшит в Claude Code; дополняется своими терминами.
+# The same built-in terms Claude Code always sends; user terms are added on top.
 DEFAULT_TERMS = ["MCP", "symlink", "grep", "regex", "localhost", "codebase", "TypeScript", "JSON",
                  "OAuth", "webhook", "gRPC", "dotfiles", "subagent", "worktree"]
 
@@ -62,15 +62,15 @@ def get_token() -> str:
         if os.path.exists(p):
             raw = open(p).read()
     if not raw:
-        sys.exit("нет OAuth-токена: залогинься в claude (/login) или задай CLAUDE_CODE_OAUTH_TOKEN")
+        sys.exit("no OAuth token: log in with `claude` (/login) or set CLAUDE_CODE_OAUTH_TOKEN")
     o = json.loads(raw).get("claudeAiOauth") or {}
     if o.get("expiresAt") and o["expiresAt"] / 1000 < time.time():
-        sys.exit("OAuth-токен протух — запусти `claude` разок, он обновит его в keychain")
+        sys.exit("OAuth token expired: run `claude` once to refresh it")
     return o["accessToken"]
 
 
 def pack_keyterms(terms: list[str]) -> str:
-    # 1:1 с функцией H() из Claude Code: убрать запятые и не-ASCII, дедуп, ≤1024 символов
+    # Same rules as Claude Code's client: drop commas and non-ASCII, dedupe, <=1024 chars
     seen, out, n = set(), [], 0
     for t in terms:
         p = re.sub(r"\s+", " ", re.sub(r"[^\x20-\x7E]", "", t.replace(",", " "))).strip()
@@ -94,7 +94,7 @@ def build_url(lang: str, interims_typed: bool, endpointing_ms: int, utterance_en
 
 def ffmpeg_cmd(src: str | None) -> list[str]:
     base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
-    if src is None:  # микрофон
+    if src is None:  # microphone
         if sys.platform == "darwin":
             dev = os.environ.get("CCSTT_MIC", ":default")
             inp = ["-f", "avfoundation", "-i", dev]
@@ -211,7 +211,7 @@ async def run(args) -> int:
         stop.set()
 
     async def sender():
-        # 100 мс кадры; для файла — с ускорением args.speed относительно реального времени
+        # 100 ms frames; files are paced at args.speed x realtime
         chunk = BYTES_PER_SEC // 10
         t0 = time.monotonic(); sent = 0
         while not stop.is_set():
@@ -231,7 +231,7 @@ async def run(args) -> int:
     ka = asyncio.create_task(keepalive())
     rd = asyncio.create_task(reader())
     if live:
-        print("🎙  говори; Enter — стоп", file=sys.stderr)
+        print("🎙  speak; press Enter to stop", file=sys.stderr)
         asyncio.create_task(wait_enter())
     try:
         await sender()
@@ -241,7 +241,7 @@ async def run(args) -> int:
         if proc.returncode is None:
             proc.terminate()
 
-    # finalize: как в CC — CloseStream, ждём endpoint (или тишину/таймаут), лишний interim превращаем в финал
+    # finalize like Claude Code: CloseStream, wait for the endpoint (or quiet/timeout), promote the last interim
     sess.closing = True
     try:
         await ws.send(CLOSE)
@@ -264,19 +264,19 @@ async def run(args) -> int:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="STT через voice_stream Claude Code")
-    ap.add_argument("file", nargs="?", help="аудио/видео файл (что угодно, что ест ffmpeg); без него — микрофон")
+    ap = argparse.ArgumentParser(description="Speech-to-text via the endpoint behind Claude Code's voice mode")
+    ap.add_argument("file", nargs="?", help="audio/video file (anything ffmpeg reads); omit for microphone")
     ap.add_argument("-l", "--language", default=os.environ.get("CCSTT_LANG", "ru"),
-                    help="en es fr ja de pt it ko hi id ru pl tr nl uk el cs da sv no (по умолчанию ru)")
-    ap.add_argument("-k", "--keyterms", help="термины через запятую (только ASCII — CC вырезает остальное)")
+                    help="en es fr ja de pt it ko hi id ru pl tr nl uk el cs da sv no (default: ru, or $CCSTT_LANG)")
+    ap.add_argument("-k", "--keyterms", help="comma-separated key terms (ASCII only)")
     ap.add_argument("-K", "--keyterms-file", default=os.environ.get("CCSTT_KEYTERMS_FILE"),
-                    help="файл с терминами, по одному на строку")
-    ap.add_argument("--no-default-terms", action="store_true", help="не добавлять базовый словарь Claude Code")
-    ap.add_argument("-o", "--output", help="записать итоговый текст в файл")
+                    help="file with key terms, one per line")
+    ap.add_argument("--no-default-terms", action="store_true", help="don't add Claude Code's built-in terms")
+    ap.add_argument("-o", "--output", help="write the final transcript to a file")
     ap.add_argument("--speed", type=float, default=float(os.environ.get("CCSTT_SPEED", "4")),
-                    help="во сколько раз быстрее реального времени слать файл (0 = без ограничения)")
-    ap.add_argument("--show-interims", action="store_true", help="показывать промежуточные гипотезы для файла")
-    ap.add_argument("--no-typed-interims", action="store_true", help="не слать forward_interims=typed")
+                    help="stream files at N x realtime (0 = unthrottled; >4 may lose the tail)")
+    ap.add_argument("--show-interims", action="store_true", help="show interim hypotheses for files too")
+    ap.add_argument("--no-typed-interims", action="store_true", help="don't send forward_interims=typed")
     ap.add_argument("--endpointing-ms", type=int, default=300)
     ap.add_argument("--utterance-end-ms", type=int, default=1000)
     ap.add_argument("--final-timeout", type=float, default=8.0)

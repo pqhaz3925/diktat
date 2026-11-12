@@ -4,8 +4,11 @@ A tiny macOS menu-bar dictation app (plus a CLI) that uses the same speech-to-te
 **Claude Code's `/voice` mode** — with your own list of key terms, so `vLLM`, `CUDA`, `nginx ingress`
 come out spelled right instead of "в LLM" or "Q the".
 
-- Global hotkey (toggle or hold-to-talk), floating live-transcript pill, result goes to the clipboard
-  (optionally auto-pasted into the front app)
+- Global hotkey (toggle or hold-to-talk) with a floating live-transcript pill
+- An editable draft: every recording is appended to it, edit freely between takes; Copy and Clear are
+  separate buttons (cleared drafts go to "Recent")
+- Optional auto-paste of each new piece into the front app
+- Survives Bluetooth headset (AirPods) profile switches and dropped connections mid-dictation
 - Drop any audio/video file on the menu to transcribe it (AVFoundation; ffmpeg fallback for ogg/opus/webm)
 - 20 languages, including Russian; custom key terms (keyterm prompting)
 - No dependencies, ~1 MB, Swift/SwiftUI, macOS 14+
@@ -32,6 +35,13 @@ open build/Diktat.app
 
 Default hotkey is **⌃⌥Space**. Change it, the language and key terms in the menu → Settings.
 Auto-paste needs Accessibility permission (System Settings → Privacy & Security → Accessibility).
+
+A prebuilt, ad-hoc signed build is attached to the GitHub releases. It is not notarized, so the first
+launch needs right-click → Open (or `xattr -dr com.apple.quarantine Diktat.app`).
+
+Troubleshooting: events go to `~/Library/Logs/Diktat.log`. Settings → "Verbose log" additionally logs
+server messages (including transcript text) and keeps the last recording as `~/Library/Logs/Diktat-last.wav`,
+which you can replay with `cli/ccstt.py ~/Library/Logs/Diktat-last.wav --speed 1`.
 
 ## CLI
 
@@ -72,6 +82,8 @@ Notes:
   webhook gRPC dotfiles subagent worktree`, plus the project folder name and words from the git branch.
   The built-ins can hurt (e.g. "GRE" → "grep"), so they can be turned off.
 - Non-ASCII key terms are stripped by Claude Code's client; write terms in the Latin spelling you want to see.
+- With `use_conversation_engine=true` the interim text is cumulative for the whole stream (pauses included);
+  the polished final `TranscriptText` + `TranscriptEndpoint` arrive right after `CloseStream`.
 - Files can be streamed at ~4× realtime reliably; unthrottled uploads lose the tail of the audio.
 - Supported languages: en es fr ja de pt it ko hi id ru pl tr nl uk el cs da sv no.
 
