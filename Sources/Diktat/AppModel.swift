@@ -42,6 +42,9 @@ final class AppModel: ObservableObject {
     }
 
     @Published var phase: Phase = .idle
+    /// The editable draft. New dictation/file transcripts are appended to it; only "Clear" empties it.
+    @Published var text: String { didSet { d.set(text, forKey: "draft") } }
+    /// Current session (recording or file) — not yet merged into `text`.
     @Published var finals: [String] = []
     @Published var pending = ""
     @Published var level: Float = 0
@@ -67,13 +70,24 @@ final class AppModel: ObservableObject {
     private var stopRequested = false
     private var sessionID = 0
 
-    var liveText: String {
+    /// What the current session has recognized so far (shown in the HUD).
+    var sessionText: String {
         (finals + (pending.isEmpty ? [] : [pending])).joined(separator: " ")
+    }
+
+    /// Draft + the in-progress session, for display while busy.
+    var displayText: String { Self.join(text, sessionText) }
+
+    static func join(_ a: String, _ b: String) -> String {
+        if b.isEmpty { return a }
+        if a.isEmpty { return b }
+        return a.last!.isWhitespace ? a + b : a + " " + b
     }
 
     private init() {
         d.register(defaults: ["language": "ru", "keyterms": "", "useBuiltinTerms": true, "holdToTalk": false,
                               "autoPaste": false, "saveTxt": true, "hotkey": HotkeyPreset.ctrlOptSpace.rawValue])
+        text = d.string(forKey: "draft") ?? ""
         language = d.string(forKey: "language") ?? "ru"
         keyterms = d.string(forKey: "keyterms") ?? ""
         useBuiltinTerms = d.bool(forKey: "useBuiltinTerms")
@@ -203,10 +217,10 @@ final class AppModel: ObservableObject {
                 await s.finish(timeout: 15)
                 stream = nil
                 guard sid == sessionID else { return }
-                let text = deliver(source: url.lastPathComponent, paste: false)
-                if saveTxtNextToFile, !text.isEmpty {
+                let result = deliver(source: url.lastPathComponent, paste: false)
+                if saveTxtNextToFile, !result.isEmpty {
                     let out = url.deletingPathExtension().appendingPathExtension("txt")
-                    if (try? (text + "\n").write(to: out, atomically: true, encoding: .utf8)) != nil {
+                    if (try? (result + "\n").write(to: out, atomically: true, encoding: .utf8)) != nil {
                         notice = "Saved \(out.lastPathComponent) · copied to clipboard"
                     }
                 }
@@ -242,20 +256,41 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Merges the finished session into the draft. Returns the session's own text.
     @discardableResult
     private func deliver(source: String?, paste: Bool = true) -> String {
         if !pending.isEmpty { finals.append(pending); pending = "" }
-        let text = finals.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else {
+        let segment = finals.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        finals = []
+        guard !segment.isEmpty else {
             if error == nil && source == nil { notice = "Nothing recognized" }
             return ""
         }
-        copy(text)
-        history.insert(HistoryEntry(text: text, source: source), at: 0)
+        // a file transcript starts on its own paragraph
+        text = source != nil && !text.isEmpty
+            ? text.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + segment
+            : Self.join(text, segment)
+        if source != nil { addHistory(segment, source: source) }
+        if paste && autoPaste {
+            pasteIntoFrontApp(segment)      // only the new piece goes into the other app
+        } else {
+            copy(text)
+        }
+        return segment
+    }
+
+    /// Archives the draft to history and empties it.
+    func clearDraft() {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty, history.first?.text != t { addHistory(t, source: nil) }
+        text = ""
+        notice = nil; error = nil
+    }
+
+    private func addHistory(_ t: String, source: String?) {
+        history.insert(HistoryEntry(text: t, source: source), at: 0)
         if history.count > 50 { history.removeLast(history.count - 50) }
         if let data = try? JSONEncoder().encode(history) { d.set(data, forKey: "history") }
-        if paste && autoPaste { pasteIntoFrontApp() }
-        return text
     }
 
     private func fail(_ msg: String) {
@@ -281,7 +316,8 @@ final class AppModel: ObservableObject {
         return AXIsProcessTrustedWithOptions(opts)
     }
 
-    private func pasteIntoFrontApp() {
+    private func pasteIntoFrontApp(_ segment: String) {
+        copy(segment)
         guard AXIsProcessTrusted() else { notice = "Copied. Grant Accessibility to auto-paste."; return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             let src = CGEventSource(stateID: .combinedSessionState)

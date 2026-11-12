@@ -50,7 +50,7 @@ struct HUDView: View {
                 .frame(width: 34, height: 22)
             Text(display)
                 .font(.system(size: 14))
-                .foregroundStyle(model.liveText.isEmpty ? .secondary : .primary)
+                .foregroundStyle(model.sessionText.isEmpty ? .secondary : .primary)
                 .lineLimit(2)
                 .truncationMode(.head)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -64,7 +64,7 @@ struct HUDView: View {
     }
 
     private var display: String {
-        if !model.liveText.isEmpty { return model.liveText }
+        if !model.sessionText.isEmpty { return model.sessionText }
         switch model.phase {
         case .connecting: return "Connecting…"
         case .recording: return "Listening…"

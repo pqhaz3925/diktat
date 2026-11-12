@@ -117,22 +117,39 @@ struct MenuView: View {
     }
 
     private var transcriptBox: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                Text(model.liveText.isEmpty ? placeholder : model.liveText)
-                    .foregroundStyle(model.liveText.isEmpty ? .secondary : .primary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                    .id("end")
+        Group {
+            if model.phase.busy {
+                // read-only while a session is running; new text streams in at the end
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(model.displayText.isEmpty ? "Listening…" : model.displayText)
+                            .foregroundStyle(model.displayText.isEmpty ? .secondary : .primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 5).padding(.vertical, 8)
+                        Color.clear.frame(height: 1).id("end")
+                    }
+                    .onChange(of: model.displayText) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
+                    .onAppear { proxy.scrollTo("end", anchor: .bottom) }
+                }
+            } else {
+                TextEditor(text: $model.text)
+                    .font(.body)
+                    .scrollContentBackground(.hidden)
+                    .padding(.vertical, 3)
+                    .overlay(alignment: .topLeading) {
+                        if model.text.isEmpty {
+                            Text(placeholder).foregroundStyle(.tertiary)
+                                .padding(.horizontal, 5).padding(.vertical, 3).allowsHitTesting(false)
+                        }
+                    }
             }
-            .frame(height: 140)
-            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-            .onChange(of: model.liveText) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
         }
+        .frame(height: 160)
+        .padding(5)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private var placeholder: String { "Press record or drop an audio/video file here." }
+    private var placeholder: String { "Press record or drop an audio/video file here. New dictation is appended; edit freely." }
 
     private var controls: some View {
         HStack(spacing: 8) {
@@ -148,7 +165,6 @@ struct MenuView: View {
                 }
                 .frame(minWidth: 96)
             }
-            .keyboardShortcut(.defaultAction)
             .disabled(model.phase == .finishing || { if case .file = model.phase { return true }; return false }())
 
             Button {
@@ -160,8 +176,10 @@ struct MenuView: View {
             if case .file = model.phase {
                 Button("Cancel", action: model.cancel)
             } else {
-                Button { model.copy(model.liveText) } label: { Image(systemName: "doc.on.doc") }
-                    .help("Copy").disabled(model.liveText.isEmpty)
+                Button { model.copy(model.text) } label: { Image(systemName: "doc.on.doc") }
+                    .help("Copy all").disabled(model.text.isEmpty || model.phase.busy)
+                Button(action: model.clearDraft) { Image(systemName: "trash") }
+                    .help("Clear (moves the text to Recent)").disabled(model.text.isEmpty || model.phase.busy)
             }
         }
     }
